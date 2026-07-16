@@ -1,0 +1,95 @@
+import time
+from typing import List
+from pydantic import BaseModel
+
+from google import genai
+from instructor.v2 import from_genai
+from instructor import Mode
+
+from app.utils.key_manager import KeyManager
+from app.graphs.state import PRReviewState, AgentFinding, NodeTelemetry
+
+class StyleFindingsList(BaseModel):
+    findings: List[AgentFinding]
+
+# Gemini 2.0 Flash Approximate Pricing
+GEMINI_INPUT_COST_1M = 0.10
+GEMINI_OUTPUT_COST_1M = 0.40
+
+async def style_agent_node(state) -> dict:
+    start_time = time.time()
+    chunks = getattr(state, "file_chunks", state.get("file_chunks", [])) if isinstance(state, dict) else state.file_chunks
+    
+    if not chunks:
+        return {}
+
+    prompt_content = "Analyze the following code patches for Logic Safety, Style, and Readability issues.\n\n"
+    for chunk in chunks:
+        prompt_content += f"File: {chunk.file_path}\n"
+        for hunk in chunk.hunks:
+            prompt_content += f"{hunk}\n"
+            
+    system_prompt = (
+        "You are a meticulous Senior Engineer. Review the provided code diffs focusing strictly on logic safety, "
+        "readability, and style. Target specifically: dead code blocks, unreachable logic paths, off-by-one index loops, "
+        "misleading variable semantics, and unhandled edge cases. "
+        "Return a structured list of AgentFindings. For multi-line issues, populate both start_line and line_number (end line). "
+        "If no style or logic issues exist, return an empty list."
+    )
+
+    input_tokens = 0
+    output_tokens = 0
+    findings = []
+
+    import asyncio
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        api_key = await KeyManager.get_next_key()
+        raw_client = genai.Client(api_key=api_key)
+        client = from_genai(raw_client, mode=Mode.TOOLS, use_async=True)
+
+        try:
+            parsed, raw = await client.chat.completions.create_with_completion(
+                model="gemini-3.5-flash",
+                response_model=StyleFindingsList,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt_content}
+                ]
+            )
+            findings = parsed.findings
+            
+            if hasattr(raw, "usage_metadata") and raw.usage_metadata:
+                input_tokens = getattr(raw.usage_metadata, "prompt_token_count", 0)
+                output_tokens = getattr(raw.usage_metadata, "candidates_token_count", 0)
+            break
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "quota" in error_str or "rate limit" in error_str or "exhausted" in error_str:
+                await KeyManager.report_rate_limit(api_key)
+            elif "503" in error_str or "unavailable" in error_str:
+                print(f"[WARNING] 503 UNAVAILABLE on key ...{api_key[-6:]}: Google's API is heavily loaded.")
+                
+            if attempt == max_attempts:
+                raise e
+                
+            sleep_time = 2 * attempt
+            print(f"[RETRY] Node style_agent_node failed on attempt {attempt}/5 with key ...{api_key[-6:]}. Retrying with a new key in {sleep_time}s...")
+            await asyncio.sleep(sleep_time)
+
+    exec_time_ms = (time.time() - start_time) * 1000
+    cost = (input_tokens / 1_000_000 * GEMINI_INPUT_COST_1M) + (output_tokens / 1_000_000 * GEMINI_OUTPUT_COST_1M)
+
+    telemetry = NodeTelemetry(
+        node_name="style_agent_node",
+        execution_time_ms=exec_time_ms,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=cost
+    )
+
+    return {
+        "style_findings": findings,
+        "telemetry": [telemetry]
+    }
