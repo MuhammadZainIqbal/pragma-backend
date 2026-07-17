@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from unidiff import PatchSet
 
 from google import genai
-from instructor.v2 import from_genai
+from instructor import from_genai
 from instructor import Mode
 
 from app.utils.key_manager import KeyManager
