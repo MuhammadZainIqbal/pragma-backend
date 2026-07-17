@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 jobs:
-  sync:
+  sync-to-hub:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,10 +14,7 @@ jobs:
           lfs: true
 
       - name: Push to Hub
-        uses: huggingface/hub-sync@v0.1.0
-        with:
-          github_repo_id: ${{ github.repository }}
-          huggingface_repo_id: MuhammadZainIqbal/pragma-backend  # Replace with your exact HF username/space-name
-          hf_token: ${{ secrets.HF_TOKEN }}
-          repo_type: space
-          space_sdk: gradio
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git push --force https://jackmuller7007:$HF_TOKEN@huggingface.co/spaces/MuhammadZainIqbal/pragma-backend main
