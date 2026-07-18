@@ -3,11 +3,20 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+# Initialize environment configurations
 load_dotenv()
 
 from app.graphs.graph import compile_pragma_graph
 
-app = FastAPI(title="PRAGMA Persistent API Server")
+# Security evaluation: Guard documentation endpoints against production scanning
+IS_PROD = os.getenv("ENVIRONMENT", "development").lower() == "production"
+
+app = FastAPI(
+    title="PRAGMA Persistent API Server",
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json"
+)
 
 # Allow frontend requests
 origins = [
