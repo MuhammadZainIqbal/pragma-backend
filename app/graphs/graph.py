@@ -97,12 +97,11 @@ def critic_router(state: PRReviewState):
 
 # --- Graph Assembly ---
 
-async def compile_pragma_graph(supabase_db_connection_string: str) -> Tuple[object, AsyncConnectionPool]:
+async def compile_pragma_graph(pool: AsyncConnectionPool) -> object:
     """
     Assembles the LangGraph DAG, binds the Supabase AsyncPostgresSaver,
     and applies HITL interruption before the publisher node.
-    Returns both the compiled graph and the connection pool so the
-    caller can explicitly close the pool and prevent orphaned connections.
+    Returns the compiled graph.
     """
     builder = StateGraph(PRReviewState)
 
@@ -142,10 +141,6 @@ async def compile_pragma_graph(supabase_db_connection_string: str) -> Tuple[obje
     builder.add_edge("publisher", END)
 
     # 7. Bind Supabase PostgreSQL State Checkpointer
-    pool = AsyncConnectionPool(
-        conninfo=supabase_db_connection_string,
-        kwargs={"autocommit": True}
-    )
     checkpointer = AsyncPostgresSaver(pool)
 
     # Auto-initialize checkpointer schema tables on first cold boot
@@ -157,5 +152,5 @@ async def compile_pragma_graph(supabase_db_connection_string: str) -> Tuple[obje
         interrupt_before=["publisher"]
     )
 
-    # Return both graph and pool so the caller owns the pool lifecycle
-    return graph, pool
+    # Return graph only
+    return graph

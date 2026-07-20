@@ -1,8 +1,10 @@
 import os
 import uuid
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from psycopg_pool import AsyncConnectionPool
 from dotenv import load_dotenv
 
 # Initialize environment configurations
@@ -13,11 +15,23 @@ from app.graphs.graph import compile_pragma_graph
 # Security evaluation: Guard documentation endpoints against production scanning
 IS_PROD = os.getenv("ENVIRONMENT", "development").lower() == "production"
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize pool with open=False, then explicitly await open
+    db_url = os.environ.get("DATABASE_URL")
+    app.state.db_pool = AsyncConnectionPool(conninfo=db_url, open=False)
+    await app.state.db_pool.open()
+    print("🚀 [PRAGMA INFO] Async Database Connection Pool Opened Successfully.")
+    yield
+    await app.state.db_pool.close()
+    print("🛑 [PRAGMA INFO] Async Database Connection Pool Closed Cleanly.")
+
 app = FastAPI(
     title="PRAGMA Persistent API Server",
     docs_url=None if IS_PROD else "/docs",
     redoc_url=None if IS_PROD else "/redoc",
-    openapi_url=None if IS_PROD else "/openapi.json"
+    openapi_url=None if IS_PROD else "/openapi.json",
+    lifespan=lifespan
 )
 
 # Allow frontend requests
@@ -35,7 +49,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def process_github_webhook(run_id: str, pr_number: int, full_name: str, diff_url: str, head_sha: str):
+async def process_github_webhook(run_id: str, pr_number: int, full_name: str, diff_url: str, head_sha: str, pool: AsyncConnectionPool):
+    print(f"🟢 [PRAGMA LOG] Ingesting webhook for PR #{pr_number}...")
     github_pat = os.environ.get("GITHUB_PAT")
     headers = {"Authorization": f"token {github_pat}"} if github_pat else {}
     
@@ -47,13 +62,9 @@ async def process_github_webhook(run_id: str, pr_number: int, full_name: str, di
             return
         diff_payload = resp.text
 
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        print("DATABASE_URL is missing")
-        return
-
+    print(f"🔵 [PRAGMA LOG] Initializing LangGraph checkpointer thread: {run_id}...")
     # 2. Compile Graph and map to Postgres checkpoint saver
-    graph, pool = await compile_pragma_graph(db_url)
+    graph = await compile_pragma_graph(pool)
     config = {"configurable": {"thread_id": run_id}}
     
     initial_state = {
@@ -64,9 +75,11 @@ async def process_github_webhook(run_id: str, pr_number: int, full_name: str, di
     }
     
     try:
+        print("🟡 [PRAGMA LOG] Invoking LangGraph agent workflow...")
         # 3. Trigger LangGraph asynchronous workflow
         await graph.ainvoke(initial_state, config=config)
         
+        print("🟠 [PRAGMA LOG] Agent workflow suspended/completed. Issuing outbound GitHub API comment...")
         # 4. Post Live UI Verification Link Back to GitHub Issues API
         comment_body = f"""### 🤖 PRAGMA // Autonomous Code Review Intercepted
 
@@ -85,12 +98,12 @@ Potential architectural execution anomalies or security risks were caught in thi
                 },
                 json={"body": comment_body}
             )
+        
+        print(f"✅ [PRAGMA LOG] GitHub comment posted successfully for run {run_id}.")
             
     except Exception as e:
         print(f"Error in background webhook processing: {e}")
-    finally:
-        # Gracefully close connection pool to prevent socket leaks
-        await pool.close()
+
 
 @app.post("/api/webhook")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -118,7 +131,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Missing required PR payload fields")
         
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(process_github_webhook, run_id, pr_number, full_name, diff_url, head_sha)
+    pool = request.app.state.db_pool
+    background_tasks.add_task(process_github_webhook, run_id, pr_number, full_name, diff_url, head_sha, pool)
     
     return {"status": "accepted", "run_id": run_id}
 
@@ -128,16 +142,14 @@ async def get_status():
     return {"status": "ok", "message": "API is online"}
 
 @app.patch("/api/reviews/{run_id}/approve")
-async def resume_run(run_id: str):
+async def resume_run(run_id: str, request: Request):
     """
     Resumes the LangGraph execution from the HITL (Human In The Loop) interrupt checkpoint.
     """
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise HTTPException(status_code=500, detail="DATABASE_URL is not configured in the environment.")
+    pool = request.app.state.db_pool
         
     # Re-initialize the LangGraph instance mapping to our Postgres saver
-    graph, pool = await compile_pragma_graph(db_url)
+    graph = await compile_pragma_graph(pool)
     
     # Map configuration to the exact run_id thread
     config = {
@@ -152,9 +164,6 @@ async def resume_run(run_id: str):
         return {"status": "success", "message": f"Run {run_id} successfully resumed."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Gracefully close the connection pool to prevent database socket leaks
-        await pool.close()
 
 if __name__ == "__main__":
     import uvicorn
