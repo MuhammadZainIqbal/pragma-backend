@@ -1,5 +1,7 @@
 import os
-from fastapi import FastAPI, HTTPException
+import uuid
+import httpx
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -32,6 +34,93 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+async def process_github_webhook(run_id: str, pr_number: int, full_name: str, diff_url: str, head_sha: str):
+    github_pat = os.environ.get("GITHUB_PAT")
+    headers = {"Authorization": f"token {github_pat}"} if github_pat else {}
+    
+    # 1. Fetch raw diff from GitHub
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(diff_url, headers=headers, follow_redirects=True)
+        if resp.status_code != 200:
+            print(f"Failed to fetch diff: {resp.status_code}")
+            return
+        diff_payload = resp.text
+
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("DATABASE_URL is missing")
+        return
+
+    # 2. Compile Graph and map to Postgres checkpoint saver
+    graph, pool = await compile_pragma_graph(db_url)
+    config = {"configurable": {"thread_id": run_id}}
+    
+    initial_state = {
+        "thread_id": run_id,
+        "pr_number": pr_number,
+        "repository": full_name,
+        "diff_payload": diff_payload
+    }
+    
+    try:
+        # 3. Trigger LangGraph asynchronous workflow
+        await graph.ainvoke(initial_state, config=config)
+        
+        # 4. Post Live UI Verification Link Back to GitHub Issues API
+        comment_body = f"""### 🤖 PRAGMA // Autonomous Code Review Intercepted
+
+Potential architectural execution anomalies or security risks were caught in this commit frame. 
+
+🔍 **[Click here to view the deep analysis and approve this build](https://pragma.zainiqbal.tech/?run_id={run_id})**"""
+        
+        comments_url = f"https://api.github.com/repos/{full_name}/issues/{pr_number}/comments"
+        
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                comments_url,
+                headers={
+                    "Authorization": f"token {github_pat}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                json={"body": comment_body}
+            )
+            
+    except Exception as e:
+        print(f"Error in background webhook processing: {e}")
+    finally:
+        # Gracefully close connection pool to prevent socket leaks
+        await pool.close()
+
+@app.post("/api/webhook")
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Handles incoming GitHub pull_request events.
+    """
+    event = request.headers.get("X-GitHub-Event")
+    if event != "pull_request":
+        return {"status": "ignored", "reason": f"Event '{event}' is not pull_request"}
+        
+    payload = await request.json()
+    action = payload.get("action")
+    if action not in ["opened", "synchronize"]:
+        return {"status": "ignored", "reason": f"Action '{action}' ignored"}
+        
+    pr = payload.get("pull_request", {})
+    repo = payload.get("repository", {})
+    
+    diff_url = pr.get("diff_url")
+    full_name = repo.get("full_name")
+    pr_number = pr.get("number")
+    head_sha = pr.get("head", {}).get("sha")
+    
+    if not all([diff_url, full_name, pr_number, head_sha]):
+        raise HTTPException(status_code=400, detail="Missing required PR payload fields")
+        
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(process_github_webhook, run_id, pr_number, full_name, diff_url, head_sha)
+    
+    return {"status": "accepted", "run_id": run_id}
 
 @app.get("/api/status")
 async def get_status():
