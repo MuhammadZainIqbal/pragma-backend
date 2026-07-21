@@ -123,9 +123,10 @@ async def critic_node(state: PRReviewState) -> dict:
                 if attempt == max_attempts:
                     raise e
                     
-                sleep_time = 2 * attempt
-                print(f"[RETRY] Node critic_node failed on attempt {attempt}/5 with key ...{api_key[-6:]}. Retrying with a new key in {sleep_time}s...")
-                await asyncio.sleep(sleep_time)
+                import random
+                backoff_delay = (2 ** attempt) + random.uniform(1.0, 3.0)
+                print(f"⚠️ [PRAGMA KEY MANAGER] Key ...{api_key[-6:]} hit 503 spike. Retrying in {backoff_delay:.2f}s (Attempt {attempt}/5)...")
+                await asyncio.sleep(backoff_delay)
 
     # Return the idempotently consolidated findings.
     # Note: Because LangGraph strictly appends to `operator.add` keys, deduplicating them here

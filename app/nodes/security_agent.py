@@ -73,9 +73,10 @@ async def security_agent_node(state) -> dict:
             if attempt == max_attempts:
                 raise e
                 
-            sleep_time = 2 * attempt
-            print(f"[RETRY] Node security_agent_node failed on attempt {attempt}/5 with key ...{api_key[-6:]}. Retrying with a new key in {sleep_time}s...")
-            await asyncio.sleep(sleep_time)
+            import random
+            backoff_delay = (2 ** attempt) + random.uniform(1.0, 3.0)
+            print(f"⚠️ [PRAGMA KEY MANAGER] Key ...{api_key[-6:]} hit 503 spike. Retrying in {backoff_delay:.2f}s (Attempt {attempt}/5)...")
+            await asyncio.sleep(backoff_delay)
 
     exec_time_ms = (time.time() - start_time) * 1000
     cost = (input_tokens / 1_000_000 * GEMINI_INPUT_COST_1M) + (output_tokens / 1_000_000 * GEMINI_OUTPUT_COST_1M)
