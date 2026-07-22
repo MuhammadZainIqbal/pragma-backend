@@ -1,11 +1,13 @@
 import os
 import uuid
 import httpx
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import AsyncConnectionPool
 from dotenv import load_dotenv
+from google import genai
 
 # Initialize environment configurations
 load_dotenv()
@@ -135,6 +137,35 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_github_webhook, run_id, pr_number, full_name, diff_url, head_sha, pool)
     
     return {"status": "accepted", "run_id": run_id}
+
+@app.get("/api/test-keys")
+async def test_keys_on_render():
+    # Extract keys from GEMINI_API_KEYS or individual ENV vars
+    raw_keys = os.getenv("GEMINI_API_KEYS", "")
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()] if raw_keys else []
+    
+    if not keys:
+        for env_key, val in os.environ.items():
+            if "GEMINI" in env_key.upper() and "KEY" in env_key.upper() and val:
+                if val.strip() not in keys and not val.startswith("http"):
+                    keys.append(val.strip())
+
+    results = []
+    for key in keys:
+        suffix = f"...{key[-6:]}" if len(key) >= 6 else key
+        try:
+            client = genai.Client(api_key=key)
+            # Run test ping in thread pool
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.5-flash",
+                contents="Say OK"
+            )
+            results.append({"key": suffix, "status": "200 OK", "response": response.text.strip()})
+        except Exception as e:
+            results.append({"key": suffix, "status": "FAILED", "error": str(e)})
+            
+    return {"total_tested": len(keys), "results": results}
 
 @app.get("/api/status")
 async def get_status():
