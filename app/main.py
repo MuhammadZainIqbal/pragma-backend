@@ -4,6 +4,7 @@ import httpx
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import AsyncConnectionPool
 from dotenv import load_dotenv
@@ -36,16 +37,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Allow frontend requests
-origins = [
-    "http://localhost:5173",
-    "https://pragma-frontend.vercel.app", 
-    "https://pragma.usbro.dev", # Zain's custom domain
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, 
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -166,6 +160,28 @@ async def test_keys_on_render():
             results.append({"key": suffix, "status": "FAILED", "error": str(e)})
             
     return {"total_tested": len(keys), "results": results}
+
+@app.get("/api/state")
+async def get_state(run_id: str, request: Request):
+    try:
+        pool = request.app.state.db_pool
+        graph = await compile_pragma_graph(pool)
+        config = {"configurable": {"thread_id": run_id}}
+        
+        # Pull state directly from LangGraph app
+        state = await graph.aget_state(config)
+        
+        if not state or not state.values:
+            return JSONResponse(content={"status": "processing", "values": None})
+            
+        return JSONResponse(content={
+            "status": "completed" if not state.next else "interrupted",
+            "values": state.values,
+            "next": state.next
+        })
+    except Exception as e:
+        print(f"Error fetching state for run_id {run_id}: {e}")
+        return JSONResponse(content={"status": "error", "message": str(e), "values": None}, status_code=500)
 
 @app.get("/api/status")
 async def get_status():
