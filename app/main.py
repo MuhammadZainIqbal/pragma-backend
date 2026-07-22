@@ -5,6 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import AsyncConnectionPool
 from dotenv import load_dotenv
@@ -176,7 +177,7 @@ async def get_state(run_id: str, request: Request):
             
         return JSONResponse(content={
             "status": "completed" if not state.next else "interrupted",
-            "values": state.values,
+            "values": jsonable_encoder(state.values),
             "next": state.next
         })
     except Exception as e:
