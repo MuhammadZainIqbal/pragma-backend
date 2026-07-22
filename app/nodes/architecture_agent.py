@@ -6,7 +6,7 @@ from google import genai
 from instructor.v2 import from_genai
 from instructor import Mode
 
-from app.utils.key_manager import KeyManager
+from app.utils.key_manager import KeyManager, llm_semaphore
 from app.graphs.state import PRReviewState, AgentFinding, NodeTelemetry
 
 class ArchitectureFindingsList(BaseModel):
@@ -51,14 +51,16 @@ async def architecture_agent_node(state) -> dict:
         client = from_genai(raw_client, mode=Mode.TOOLS, use_async=True)
 
         try:
-            parsed, raw = await client.chat.completions.create_with_completion(
-                model="gemini-3.5-flash",
-                response_model=ArchitectureFindingsList,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt_content}
-                ]
-            )
+            async with llm_semaphore:
+                print(f"🔒 [PRAGMA KEY MANAGER] Lock acquired for key ...{api_key[-6:]}. Executing LLM request...")
+                parsed, raw = await client.chat.completions.create_with_completion(
+                    model="gemini-3.5-flash",
+                    response_model=ArchitectureFindingsList,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt_content}
+                    ]
+                )
             findings = parsed.findings
             
             if hasattr(raw, "usage_metadata") and raw.usage_metadata:

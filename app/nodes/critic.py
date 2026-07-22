@@ -9,7 +9,7 @@ from google import genai
 from instructor import from_genai
 from instructor import Mode
 
-from app.utils.key_manager import KeyManager
+from app.utils.key_manager import KeyManager, llm_semaphore
 from app.graphs.state import AgentFinding, PRReviewState
 
 class QualityEvaluation(BaseModel):
@@ -99,17 +99,19 @@ async def critic_node(state: PRReviewState) -> dict:
 
             try:
                 # Execute native async Gemini validation via instructor directly in the event loop
-                eval_result: QualityEvaluation = await client.chat.completions.create(
-                    model="gemini-3.5-flash",
-                    response_model=QualityEvaluation,
-                    messages=[
-                        {
-                            "role": "system", 
-                            "content": "You are a Senior Staff Code Reviewer. Score the overall quality of a PR from 0.0 (terrible) to 1.0 (perfect) based strictly on the severity and frequency of the findings."
-                        },
-                        {"role": "user", "content": prompt_content}
-                    ]
-                )
+                async with llm_semaphore:
+                    print(f"🔒 [PRAGMA KEY MANAGER] Lock acquired for key ...{api_key[-6:]}. Executing LLM request...")
+                    eval_result: QualityEvaluation = await client.chat.completions.create(
+                        model="gemini-3.5-flash",
+                        response_model=QualityEvaluation,
+                        messages=[
+                            {
+                                "role": "system", 
+                                "content": "You are a Senior Staff Code Reviewer. Score the overall quality of a PR from 0.0 (terrible) to 1.0 (perfect) based strictly on the severity and frequency of the findings."
+                            },
+                            {"role": "user", "content": prompt_content}
+                        ]
+                    )
                 score = eval_result.score
                 reasoning = eval_result.reasoning
                 break

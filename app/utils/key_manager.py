@@ -8,6 +8,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Ensure only 1 LLM request hits Google's API at any given millisecond
+llm_semaphore = asyncio.Semaphore(1)
+
 # Parse globally ONCE at import
 _raw_keys = os.environ.get("GEMINI_API_KEYS", "")
 _GLOBAL_KEYS = []
