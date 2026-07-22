@@ -1,12 +1,9 @@
 import time
+import asyncio
 from typing import List
 from pydantic import BaseModel
 
-from google import genai
-from instructor.v2 import from_genai
-from instructor import Mode
-
-from app.utils.key_manager import KeyManager, llm_semaphore
+from app.utils.key_manager import KeyManager
 from app.graphs.state import PRReviewState, AgentFinding, NodeTelemetry
 
 class ArchitectureFindingsList(BaseModel):
@@ -17,7 +14,6 @@ GEMINI_INPUT_COST_1M = 0.10
 GEMINI_OUTPUT_COST_1M = 0.40
 
 async def architecture_agent_node(state) -> dict:
-    import asyncio
     await asyncio.sleep(1.5)
     start_time = time.time()
     chunks = getattr(state, "file_chunks", state.get("file_chunks", [])) if isinstance(state, dict) else state.file_chunks
@@ -43,45 +39,20 @@ async def architecture_agent_node(state) -> dict:
     output_tokens = 0
     findings = []
 
-    import asyncio
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        api_key = await KeyManager.get_next_key()
-        raw_client = genai.Client(api_key=api_key)
-        client = from_genai(raw_client, mode=Mode.TOOLS, use_async=True)
-
-        try:
-            async with llm_semaphore:
-                print(f"🔒 [PRAGMA KEY MANAGER] Lock acquired for key ...{api_key[-6:]}. Executing LLM request...")
-                parsed, raw = await client.chat.completions.create_with_completion(
-                    model="gemini-3.5-flash",
-                    response_model=ArchitectureFindingsList,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt_content}
-                    ]
-                )
-            findings = parsed.findings
+    try:
+        parsed, usage = await KeyManager.execute_with_key_rotation(
+            system_prompt=system_prompt,
+            prompt_text=prompt_content,
+            response_schema=ArchitectureFindingsList
+        )
+        findings = parsed.findings
+        
+        if usage:
+            input_tokens = getattr(usage, "prompt_token_count", 0)
+            output_tokens = getattr(usage, "candidates_token_count", 0)
             
-            if hasattr(raw, "usage_metadata") and raw.usage_metadata:
-                input_tokens = getattr(raw.usage_metadata, "prompt_token_count", 0)
-                output_tokens = getattr(raw.usage_metadata, "candidates_token_count", 0)
-            break
-            
-        except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "quota" in error_str or "rate limit" in error_str or "exhausted" in error_str:
-                await KeyManager.report_rate_limit(api_key)
-            elif "503" in error_str or "unavailable" in error_str:
-                print(f"[WARNING] 503 UNAVAILABLE on key ...{api_key[-6:]}: Google's API is heavily loaded.")
-                
-            if attempt == max_attempts:
-                raise e
-                
-            import random
-            backoff_delay = (2 ** attempt) + random.uniform(1.0, 3.0)
-            print(f"⚠️ [PRAGMA KEY MANAGER] Key ...{api_key[-6:]} hit 503 spike. Retrying in {backoff_delay:.2f}s (Attempt {attempt}/5)...")
-            await asyncio.sleep(backoff_delay)
+    except Exception as e:
+        print(f"Node architecture_agent_node failed completely: {e}")
 
     exec_time_ms = (time.time() - start_time) * 1000
     cost = (input_tokens / 1_000_000 * GEMINI_INPUT_COST_1M) + (output_tokens / 1_000_000 * GEMINI_OUTPUT_COST_1M)

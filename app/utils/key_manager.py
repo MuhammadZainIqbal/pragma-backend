@@ -1,9 +1,14 @@
 import os
+import re
 import time
 import asyncio
+import random
 import logging
 
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -11,61 +16,56 @@ logger = logging.getLogger(__name__)
 # Ensure only 1 LLM request hits Google's API at any given millisecond
 llm_semaphore = asyncio.Semaphore(1)
 
-# Parse globally ONCE at import
-_raw_keys = os.environ.get("GEMINI_API_KEYS", "")
-_GLOBAL_KEYS = []
-if _raw_keys:
-    for key in [k.strip() for k in _raw_keys.split(",") if k.strip()]:
-        _GLOBAL_KEYS.append({
-            "key": key,
-            "last_used_at": 0.0,
-            "is_active": True,
-            "cooldown_until": 0.0
-        })
+def get_all_keys():
+    keys = []
+    raw_keys = os.environ.get("GEMINI_API_KEYS", "")
+    if raw_keys:
+        for k in raw_keys.split(","):
+            k = k.strip()
+            if k and k not in keys:
+                keys.append(k)
+
+    for key, value in os.environ.items():
+        if re.match(r"^GEMINI_API_KEY_\d+$", key):
+            v = value.strip()
+            if v and v not in keys:
+                keys.append(v)
+    return keys
 
 class KeyManager:
-    _lock = asyncio.Lock()
-
     @classmethod
-    async def get_next_key(cls) -> str:
-        # Wrap the entire selection, sort, and update block in the lock
-        async with cls._lock:
-            if not _GLOBAL_KEYS:
-                raise ValueError("No API keys configured in GEMINI_API_KEYS.")
-
-            now = time.time()
-            active_keys = [k for k in _GLOBAL_KEYS if k["is_active"]]
+    async def execute_with_key_rotation(cls, system_prompt, prompt_text, response_schema):
+        keys = get_all_keys()
+        if not keys:
+            raise Exception("No Gemini API keys found in environment.")
             
-            if not active_keys:
-                raise ValueError("All configured API keys have been deactivated.")
-
-            available_keys = [k for k in active_keys if now >= k["cooldown_until"]]
+        max_attempts = 5
+        
+        for attempt in range(1, max_attempts + 1):
+            key = keys[(attempt - 1) % len(keys)]
+            suffix = f"...{key[-6:]}" if len(key) >= 6 else key
             
-            if not available_keys:
-                min_cooldown = min(k["cooldown_until"] for k in active_keys)
-                wait_time = max(0.1, min_cooldown - time.time())
-                logger.warning(f"All keys on cooldown. Waiting {wait_time:.2f}s...")
-                need_wait = True
-            else:
-                available_keys.sort(key=lambda k: k["last_used_at"])
-                selected = available_keys[0]
+            try:
+                async with llm_semaphore:
+                    print(f"🔒 [PRAGMA KEY MANAGER] Lock acquired for key [{suffix}]. Executing LLM request...")
+                    client = genai.Client(api_key=key)
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model="gemini-3.5-flash",
+                        contents=prompt_text,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            response_mime_type="application/json",
+                            response_schema=response_schema,
+                        ),
+                    )
+                    print(f"✅ [PRAGMA KEY MANAGER] Key [{suffix}] succeeded on attempt {attempt}.")
+                    parsed_output = response_schema.model_validate_json(response.text)
+                    return parsed_output, getattr(response, "usage_metadata", None)
+                    
+            except Exception as e:
+                backoff = (2 ** attempt) + random.uniform(1.0, 2.0)
+                print(f"⚠️ [PRAGMA KEY MANAGER] Key [{suffix}] error ({e}). Retrying with next key in {backoff:.2f}s (Attempt {attempt}/{max_attempts})...")
+                await asyncio.sleep(backoff)
                 
-                # Agent 1 fully updates last_used_at before lock is released
-                selected["last_used_at"] = time.time()
-                
-                api_key = selected["key"]
-                print(f"[KEY MANAGER] Handing out key: ...{api_key[-6:]}")
-                return api_key
-                
-        # If we didn't return, it means we need to wait (sleep outside lock)
-        await asyncio.sleep(wait_time)
-        return await cls.get_next_key()
-
-    @classmethod
-    async def report_rate_limit(cls, key: str):
-        async with cls._lock:
-            for k in _GLOBAL_KEYS:
-                if k["key"] == key:
-                    logger.warning(f"Gemini 429 Rate Limit encountered for key ...{key[-6:]}. Cooling down for 60s.")
-                    k["cooldown_until"] = time.time() + 60.0
-                    break
+        raise Exception("All API keys and retries exhausted.")

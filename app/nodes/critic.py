@@ -1,15 +1,11 @@
-import asyncio
 import time
+import asyncio
 from typing import Dict, Tuple
 
 from pydantic import BaseModel, Field
 from unidiff import PatchSet
 
-from google import genai
-from instructor import from_genai
-from instructor import Mode
-
-from app.utils.key_manager import KeyManager, llm_semaphore
+from app.utils.key_manager import KeyManager
 from app.graphs.state import AgentFinding, PRReviewState
 
 class QualityEvaluation(BaseModel):
@@ -81,7 +77,7 @@ async def critic_node(state: PRReviewState) -> dict:
                 
     final_findings_list = list(deduped_map.values())
     
-    # 3. Quality Scoring Pass via Gemini Token Bucket Pool
+    # 3. Quality Scoring Pass via Gemini Native SDK
     score = 1.0  # Default to perfect if no findings
     reasoning = "No findings to evaluate. PR looks solid."
     
@@ -90,50 +86,20 @@ async def critic_node(state: PRReviewState) -> dict:
         for idx, finding in enumerate(final_findings_list):
             prompt_content += f"{idx+1}. File: {finding.file_path}:{finding.line_number} | Severity: {finding.severity} | {finding.description}\n"
             
-        import asyncio
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            api_key = await KeyManager.get_next_key()
-            raw_client = genai.Client(api_key=api_key)
-            client = from_genai(raw_client, mode=Mode.TOOLS, use_async=True)
-
-            try:
-                # Execute native async Gemini validation via instructor directly in the event loop
-                async with llm_semaphore:
-                    print(f"🔒 [PRAGMA KEY MANAGER] Lock acquired for key ...{api_key[-6:]}. Executing LLM request...")
-                    eval_result: QualityEvaluation = await client.chat.completions.create(
-                        model="gemini-3.5-flash",
-                        response_model=QualityEvaluation,
-                        messages=[
-                            {
-                                "role": "system", 
-                                "content": "You are a Senior Staff Code Reviewer. Score the overall quality of a PR from 0.0 (terrible) to 1.0 (perfect) based strictly on the severity and frequency of the findings."
-                            },
-                            {"role": "user", "content": prompt_content}
-                        ]
-                    )
-                score = eval_result.score
-                reasoning = eval_result.reasoning
-                break
-            except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "quota" in error_str or "rate limit" in error_str or "exhausted" in error_str:
-                    await KeyManager.report_rate_limit(api_key)
-                elif "503" in error_str or "unavailable" in error_str:
-                    print(f"[WARNING] 503 UNAVAILABLE on key ...{api_key[-6:]}: Google's API is heavily loaded.")
-                    
-                if attempt == max_attempts:
-                    raise e
-                    
-                import random
-                backoff_delay = (2 ** attempt) + random.uniform(1.0, 3.0)
-                print(f"⚠️ [PRAGMA KEY MANAGER] Key ...{api_key[-6:]} hit 503 spike. Retrying in {backoff_delay:.2f}s (Attempt {attempt}/5)...")
-                await asyncio.sleep(backoff_delay)
+        system_prompt = "You are a Senior Staff Code Reviewer. Score the overall quality of a PR from 0.0 (terrible) to 1.0 (perfect) based strictly on the severity and frequency of the findings."
+        
+        try:
+            eval_result, _ = await KeyManager.execute_with_key_rotation(
+                system_prompt=system_prompt,
+                prompt_text=prompt_content,
+                response_schema=QualityEvaluation
+            )
+            score = eval_result.score
+            reasoning = eval_result.reasoning
+        except Exception as e:
+            print(f"Node critic_node failed completely: {e}")
 
     # Return the idempotently consolidated findings.
-    # Note: Because LangGraph strictly appends to `operator.add` keys, deduplicating them here
-    # safely "accounts for" stale iterations. To completely purge the ballooning in state,
-    # the reducer in state.py must be modified, but this guarantees correct logic downstream.
     return {
         "final_findings": final_findings_list,
         "pr_quality_score": score,
