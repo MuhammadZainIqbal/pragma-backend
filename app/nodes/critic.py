@@ -6,12 +6,16 @@ from pydantic import BaseModel, Field
 from unidiff import PatchSet
 
 from app.utils.key_manager import KeyManager
-from app.graphs.state import AgentFinding, PRReviewState
+from app.graphs.state import AgentFinding, PRReviewState, NodeTelemetry
 
 class QualityEvaluation(BaseModel):
     """Structured LLM output for overall PR evaluation."""
     score: float = Field(..., description="Overall PR quality score from 0.0 to 1.0")
     reasoning: str = Field(..., description="Explanation for the score")
+
+# Gemini 3.5 Flash Approximate Pricing
+GEMINI_INPUT_COST_1M = 0.075
+GEMINI_OUTPUT_COST_1M = 0.30
 
 async def critic_node(state: PRReviewState) -> dict:
     """
@@ -23,6 +27,10 @@ async def critic_node(state: PRReviewState) -> dict:
     """
     
     # 1. Structural Diff Verification (Anti-Hallucination Guard)
+    start_time = time.perf_counter()
+    input_tokens = 0
+    output_tokens = 0
+
     try:
         # PatchSet requires split lines with keepends=True
         patch = PatchSet(state.diff_payload.splitlines(keepends=True))
@@ -89,19 +97,34 @@ async def critic_node(state: PRReviewState) -> dict:
         system_prompt = "You are a Senior Staff Code Reviewer. Score the overall quality of a PR from 0.0 (terrible) to 1.0 (perfect) based strictly on the severity and frequency of the findings."
         
         try:
-            eval_result, _ = await KeyManager.execute_with_key_rotation(
+            eval_result, usage = await KeyManager.execute_with_key_rotation(
                 system_prompt=system_prompt,
                 prompt_text=prompt_content,
                 response_schema=QualityEvaluation
             )
             score = eval_result.score
             reasoning = eval_result.reasoning
+            if usage:
+                input_tokens = getattr(usage, "prompt_token_count", 0)
+                output_tokens = getattr(usage, "candidates_token_count", 0)
         except Exception as e:
             print(f"Node critic_node failed completely: {e}")
+
+    exec_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    cost = (input_tokens / 1_000_000 * GEMINI_INPUT_COST_1M) + (output_tokens / 1_000_000 * GEMINI_OUTPUT_COST_1M)
+
+    telemetry = NodeTelemetry(
+        node_name="critic_node",
+        execution_time_ms=exec_time_ms,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=cost
+    )
 
     # Return the idempotently consolidated findings.
     return {
         "final_findings": final_findings_list,
         "pr_quality_score": score,
-        "critic_retry_count": state.critic_retry_count + 1
+        "critic_retry_count": state.critic_retry_count + 1,
+        "telemetry": [telemetry]
     }

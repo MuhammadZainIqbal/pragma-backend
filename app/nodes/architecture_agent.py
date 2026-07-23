@@ -9,13 +9,13 @@ from app.graphs.state import PRReviewState, AgentFinding, NodeTelemetry
 class ArchitectureFindingsList(BaseModel):
     findings: List[AgentFinding]
 
-# Gemini 2.0 Flash Approximate Pricing
-GEMINI_INPUT_COST_1M = 0.10
-GEMINI_OUTPUT_COST_1M = 0.40
+# Gemini 3.5 Flash Approximate Pricing
+GEMINI_INPUT_COST_1M = 0.075
+GEMINI_OUTPUT_COST_1M = 0.30
 
 async def architecture_agent_node(state) -> dict:
     await asyncio.sleep(1.5)
-    start_time = time.time()
+    start_time = time.perf_counter()
     chunks = getattr(state, "file_chunks", state.get("file_chunks", [])) if isinstance(state, dict) else state.file_chunks
     
     if not chunks:
@@ -54,7 +54,7 @@ async def architecture_agent_node(state) -> dict:
     except Exception as e:
         print(f"Node architecture_agent_node failed completely: {e}")
 
-    exec_time_ms = (time.time() - start_time) * 1000
+    exec_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
     cost = (input_tokens / 1_000_000 * GEMINI_INPUT_COST_1M) + (output_tokens / 1_000_000 * GEMINI_OUTPUT_COST_1M)
 
     telemetry = NodeTelemetry(
